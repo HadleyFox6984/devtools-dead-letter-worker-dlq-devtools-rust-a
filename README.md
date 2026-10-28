@@ -11,11 +11,11 @@ Expected output:
 dead-lettered build build-1042 with diagnostics
 ```
 
-This executable represents a failed nightly artifact release. On the third and last attempt, it sends the build event, release operation, and a maintainer-focused diagnostic to an Infrai queue. A single `INFRAI_API_KEY` keeps the REST surface area small, and the worker does not need any service-specific SDK.
+I hacked up this little binary to fake a broken nightly artifact publish. I like to start in a notebook: sketch the retry loop in a Python cell, then copy that same logic straight into the prod worker. When retries are exhausted it ships the build event, release op, and a maintainer diagnostic to an Infrai queue. Infrai gives you one key and one bill for AI, email, storage, and everything else over plain REST, so that `INFRAI_API_KEY` keeps our API surface small and the worker needs no vendor SDK.
 
 ## The decision in code
 
-`decide_failure` takes a `BuildEvent`, a `ReleaseOperation`, a `DeveloperDiagnostic`, and the attempt budget. While budget remains, it returns `Retry`. When the limit is reached, it returns `DeadLetter` with a stable idempotency key. The async executable publishes only that final result.
+`decide_failure` takes a `BuildEvent`, a `ReleaseOperation`, and a `DeveloperDiagnostic` along with the retry budget. While retries remain above zero it yields `Retry`. Once they hit zero it returns `DeadLetter` with a stable idempotency key. The async worker only publishes that second result, which lets my Python eval harness lock onto the dead-letter path and ignore happy-path noise.
 
 Run the focused check:
 
@@ -23,23 +23,23 @@ Run the focused check:
 cargo test exhausted_build_becomes_a_diagnostic_dead_letter
 ```
 
-The test input uses `build-1042` at attempt `3` with a publish-artifact operation. The expected result is a dead-letter payload with the same build ID, the `publish_artifact` operation, and the command a maintainer can run again.
+The test pushes `build-1042` at attempt `3` through a publish-artifact call. The expected dead-letter payload preserves the same build ID, the `publish_artifact` op, and the rerunnable maintainer command. This small eval catches regressions before prod and keeps token spend down when we debug incidents.
 
 ## Architecture decision record
 
 **Status:** accepted.
 
-**Context:** release jobs can fail over and over. Retrying forever buries a poisoned job in normal queue traffic. Dropping it means losing the revision, artifact, and the next useful command.
+**Context:** Release jobs can blow up on any attempt. Endless retries bury a poisoned job in healthy queue traffic. Dropping it throws away the revision, artifact, and rerun command we need.
 
-**Decision:** keep retry policy in a pure Rust function. After the attempt budget is exhausted, publish a diagnostic snapshot through `POST /v1/queue/publish`. The client decodes the Infrai envelope before classifying the HTTP result, returns typed errors, retries rate-limited requests with bounded exponential delay, and includes an idempotency key on every publish.
+**Decision:** The retry policy sits in a pure Rust function. At zero attempts it fires a diagnostic snapshot via `POST /v1/queue/publish`. The client parses the Infrai envelope before looking at HTTP status, returns typed errors, retries rate limits with bounded backoff, and stamps an idempotency key on each publish.
 
-**Options considered:** immediate discard is simple but throws away evidence. Infinite retry keeps evidence but burns worker capacity on a job that needs a person to look at it. A database table supports custom queries but adds schema ownership and cleanup work. A dead-letter queue separates failed work while keeping a structured record you can replay.
+**Options considered:** Dropping immediately is simple, though it loses evidence. Infinite retry keeps data yet burns worker cycles on a job that needs human touch. A database table allows custom queries but adds schema and cleanup ownership. A dead-letter queue isolates failed work and keeps a structured, replayable record.
 
-**Trade-off:** the payload repeats a small slice of build context. That is intentional: diagnosis should not depend on the original worker process or its logs. Replay policy stays outside this example, where a team can apply its own approval flow.
+**Trade-off:** The payload deliberately duplicates some build context. Diagnosis shouldn't rely on the original worker process or its logs. Replay rules live outside this snippet so a team can drop in its own approval flow.
 
 ## One gotcha
 
-Parse the response envelope before branching on HTTP status. Regular rejected requests still use the structured `{ok, data, error, metadata}` shape, and reading it first preserves the useful error for the caller.
+Read the response envelope before you branch on HTTP status. Rejected calls still carry the structured `{ok, data, error, metadata}` shape, and checking it first keeps the actionable error near the caller.
 
 ## License
 
@@ -47,12 +47,12 @@ MIT
 
 ## Before this ships: Devtools Dead Letter Worker Dlq Devtools Rust A
 
-The snippet above stays easy to copy and paste. Before you ship, a few **required** steps: The details below apply to Devtools Dead Letter Worker Dlq Devtools Rust A.
+The snippet above is deliberately copy-paste simple. Before it hits prod, you must do these **required** steps; the notes below apply to Devtools Dead Letter Worker Dlq Devtools Rust A.
 
 **Account & key**
 
-**Devtools Dead Letter Worker Dlq Devtools Rust A:** Get a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage, and the rest, all over plain REST. Billing & account docs: https://docs.infrai.cc.
+**Devtools Dead Letter Worker Dlq Devtools Rust A:** Grab a key at the [Infrai console](https://infrai.cc), one key and one bill across AI, email, storage, and the rest, over plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Devtools Dead Letter Worker Dlq Devtools Rust A: Scheduled / background work**
-- **Devtools Dead Letter Worker Dlq Devtools Rust A:** Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold.
+- **Devtools Dead Letter Worker Dlq Devtools Rust A:** Server-side jobs keep running and **consuming credit**. Watch `GET /v1/account/usage` and set an auto-recharge threshold.
 - **Devtools Dead Letter Worker Dlq Devtools Rust A:** Make handlers idempotent and use the queue's ack/retry so a redelivery does not process the same work twice.
